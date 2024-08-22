@@ -177,7 +177,7 @@ func replanJoin(ctx *sql.Context, n *plan.JoinNode, a *Analyzer, scope *plan.Sco
 		return nil, err
 	}
 
-	err = addMergeJoins(m)
+	err = addMergeJoins(ctx, m)
 	if err != nil {
 		return nil, err
 	}
@@ -974,7 +974,7 @@ func satisfiesScalarRefs(e sql.Expression, tables sql.FastIntSet) bool {
 // with native indexes providing sort enforcement on an equality
 // filter.
 // TODO: sort-merge joins
-func addMergeJoins(m *memo.Memo) error {
+func addMergeJoins(ctx *sql.Context, m *memo.Memo) error {
 	return memo.DfsRel(m.Root(), func(e memo.RelExpr) error {
 		var join *memo.JoinBase
 		switch e := e.(type) {
@@ -1004,7 +1004,10 @@ func addMergeJoins(m *memo.Memo) error {
 		eqFilters := make([]filterAndPosition, 0, len(join.Filter))
 		for filterPos, filter := range join.Filter {
 			switch eq := filter.(type) {
-			case *expression.Equals:
+			case expression.Equality:
+				if !eq.RepresentsEquality() {
+					continue
+				}
 				l := eq.Left()
 				r := eq.Right()
 
@@ -1013,9 +1016,12 @@ func addMergeJoins(m *memo.Memo) error {
 					continue
 				}
 
-				// check that comparer is not non-decreasing
-				if !isWeaklyMonotonic(l) || !isWeaklyMonotonic(r) {
-					continue
+				// TODO: should probably check for monotonicity for non-GMS expressions
+				if _, ok := eq.(*expression.Equals); ok {
+					// check that comparer is not non-decreasing
+					if !isWeaklyMonotonic(l) || !isWeaklyMonotonic(r) {
+						continue
+					}
 				}
 
 				var swap bool
@@ -1031,7 +1037,11 @@ func addMergeJoins(m *memo.Memo) error {
 				}
 
 				if swap {
-					eqFilters = append(eqFilters, filterAndPosition{expression.NewEquals(eq.Right(), eq.Left()), filterPos})
+					swappedExpr, err := eq.SwapParameters(ctx)
+					if err != nil {
+						return err
+					}
+					eqFilters = append(eqFilters, filterAndPosition{swappedExpr, filterPos})
 				} else {
 					eqFilters = append(eqFilters, filterAndPosition{eq, filterPos})
 				}
@@ -1190,7 +1200,7 @@ func rightIndexMatchesFilters(rIndex *memo.Index, constants sql.ColSet, filters 
 
 // filterAndPosition stores a filter on a join, along with that filter's original index.
 type filterAndPosition struct {
-	filter *expression.Equals
+	filter expression.Equality
 	pos    int
 }
 
@@ -1252,13 +1262,13 @@ func sortedIndexScansForTableCol(ctx *sql.Context, statsProv sql.StatsProvider, 
 }
 
 func makeIndexScan(ctx *sql.Context, statsProv sql.StatsProvider, tab plan.TableIdNode, idx *memo.Index, matchedIdx sql.ColumnId, filters []sql.Expression) (*memo.IndexScan, bool, error) {
-	rang := make(sql.Range, len(idx.Cols()))
+	rang := make(sql.MySQLRange, len(idx.Cols()))
 	var j int
 	for {
 		found := idx.Cols()[j] == matchedIdx
 		var lit *expression.Literal
 		for _, f := range filters {
-			if eq, ok := f.(*expression.Equals); ok {
+			if eq, ok := f.(expression.Equality); ok {
 				if l, ok := eq.Left().(*expression.GetField); ok && l.Id() == idx.Cols()[j] {
 					lit, _ = eq.Right().(*expression.Literal)
 				}
@@ -1295,7 +1305,7 @@ func makeIndexScan(ctx *sql.Context, statsProv sql.StatsProvider, tab plan.Table
 		}
 	}
 
-	l := sql.IndexLookup{Index: idx.SqlIdx(), Ranges: sql.RangeCollection{rang}}
+	l := sql.IndexLookup{Index: idx.SqlIdx(), Ranges: sql.MySQLRangeCollection{rang}}
 
 	var tn sql.TableNode
 	var alias string
