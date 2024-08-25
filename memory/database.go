@@ -16,6 +16,7 @@ package memory
 
 import (
 	"fmt"
+	"sync"
 	"strings"
 	"time"
 
@@ -60,6 +61,7 @@ type BaseDatabase struct {
 	events            []sql.EventDefinition
 	primaryKeyIndexes bool
 	collation         sql.CollationID
+	rw 				  sync.RWMutex
 }
 
 var _ MemoryDatabase = (*Database)(nil)
@@ -103,6 +105,8 @@ func (d *BaseDatabase) Name() string {
 
 // Tables returns all tables in the database.
 func (d *BaseDatabase) Tables() map[string]sql.Table {
+	d.rw.Lock()
+	defer d.rw.Unlock()
 	tables := make(map[string]sql.Table, len(d.tables))
 	for name, table := range d.tables {
 		tables[name] = table
@@ -133,6 +137,8 @@ func (d *BaseDatabase) GetTableInsensitive(ctx *sql.Context, tblName string) (sq
 // putTable writes the table given into database storage. A table with this name must already be present.
 func (d *BaseDatabase) putTable(t *Table) {
 	lowerName := strings.ToLower(t.name)
+	d.rw.Lock()
+	defer  d.rw.Unlock()
 	for name, table := range d.tables {
 		if strings.ToLower(name) == lowerName {
 			t.name = table.Name()
